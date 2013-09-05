@@ -1,0 +1,181 @@
+HeatTemplateFormatVersion: '2012-12-12'
+Description: |
+  Template which starts tilemill
+Parameters:
+  KeyName:
+    Type: String
+  InstanceType:
+    Type: String
+  ImageId:
+    Type: String
+  DBUsername: {Default: ubuntu, NoEcho: 'true',
+    Description: The database admin account username, Type: String,
+    MinLength: '1', MaxLength: '16', AllowedPattern: '[a-zA-Z][a-zA-Z0-9]*',
+    ConstraintDescription: must begin with a letter and contain only
+      alphanumeric characters.}
+  DBPassword: {Default: ubuntu, NoEcho: 'true',
+    Description: The database admin account password, Type: String,
+    MinLength: '1', MaxLength: '41', AllowedPattern: '[a-zA-Z0-9]*',
+    ConstraintDescription: must contain only alphanumeric characters.}
+  TileMillUsername: {Default: ubuntu, NoEcho: 'true',
+    Description: The database admin account username, Type: String,
+    MinLength: '1', MaxLength: '16', AllowedPattern: '[a-zA-Z][a-zA-Z0-9]*',
+    ConstraintDescription: must begin with a letter and contain only
+      alphanumeric characters.}
+  TileMillPassword: {Default: ubuntu, NoEcho: 'true',
+    Description: The database admin account password, Type: String,
+    MinLength: '1', MaxLength: '41', AllowedPattern: '[a-zA-Z0-9]*',
+    ConstraintDescription: must contain only alphanumeric characters.}
+  Timezone: {Default: "Australia/Melbourne", Type: String}
+Resources:
+  SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Standard firewall rules
+      SecurityGroupIngress:
+      - {IpProtocol: icmp, FromPort: '-1', ToPort: '-1', CidrIp : 0.0.0.0/0}
+      - {IpProtocol: tcp, FromPort: '22', ToPort: '22', CidrIp: 0.0.0.0/0}
+      - {IpProtocol: tcp, FromPort: '80', ToPort: '80', CidrIp: 0.0.0.0/0}
+  all_in_one:
+    Type: OS::Nova::Server
+    Metadata:
+      AWS::CloudFormation::Init:
+        config:
+          files:
+            /tmp/db_role_setup.sql:
+              content:
+                'Fn::Replace':
+                - DBPassword: {Ref: DBPassword}
+                  DBUsername: {Ref: DBUsername}
+                - |
+                  CREATE DATABASE gis;
+                  CREATE ROLE DBUsername WITH LOGIN CREATEDB UNENCRYPTED PASSWORD 'DBPassword';
+                  GRANT ALL ON DATABASE gis TO DBUsername;
+                  GRANT ALL ON SCHEMA public TO DBUsername;
+                  GRANT ALL ON ALL TABLES IN SCHEMA public TO DBUsername;
+                  ALTER USER DBUsername WITH SUPERUSER;
+                  FLUSH PRIVILEGES;
+                  EXIT
+              mode: '000644'
+              owner: root
+              group: root
+            /tmp/postgresql.conf:
+              content: |
+                shared_buffers = 8GB
+                autovaccuum = on
+                effective_cache_size = 8GB
+                work_mem = 128MB
+                maintenance_work_mem = 64MB
+                wal_buffers = 1MB
+              mode: '000644'
+              owner: root
+              group: root
+            /tmp/tilemill.config:
+              content: |
+                {
+                  "files": "/usr/share/mapbox",
+                  "coreUrl": "_IP_:20009",
+                  "tileUrl": "_IP_:20008",
+                  "listenHost": "0.0.0.0",
+                  "server": true
+                }
+              mode: '000644'
+              owner: root
+              group: root
+            /tmp/nginx-default:
+              content: |
+                server {
+                  listen 80;
+                  server_name localhost;
+                  # This configuration allows TileMill to coexist with the tile server (/datasource, /tile) on external port 80.
+                  location /tile/ {
+                    proxy_set_header Host \$http_host;
+                    proxy_pass http://127.0.0.1:20008;
+                  }
+                  location /datasource/ {
+                    proxy_set_header Host \$http_host;
+                    proxy_pass http://127.0.0.1:20008;
+                  }
+                  location /tilemill {
+                    rewrite     ^(.*)$ http://_IP_:5002 permanent;
+                  }
+                  location / {
+                    proxy_set_header Host \$http_host;
+                    proxy_pass http://127.0.0.1:20009;
+                    auth_basic "Restricted";
+                    auth_basic_user_file htpasswd;
+                  }
+                }
+                server {
+                  listen 5002;
+                  server_name localhost;
+                  location / {
+                    proxy_set_header Host \$http_host;
+                    proxy_pass http://127.0.0.1:20008;
+                    auth_basic "Restricted";
+                    auth_basic_user_file htpasswd;
+                  }
+                }
+              mode: '000644'
+              owner: root
+              group: root
+          packages:
+            apt:
+              policykit-1: []
+              postgresql: []
+              libpq-dev: []
+              postgis: []
+              software-properties-common: []
+              git: []
+              unzip: []
+              osm2pgsql: []
+              tilemill: []
+              nginx: []
+    Properties:
+      image: {Ref: ImageId}
+      flavor: {Ref: InstanceType}
+      key_name: {Ref: KeyName}
+      security_groups: [{Ref: SecurityGroup}]
+      user_data:
+        Fn::Base64:
+          Fn::Replace:
+          - 'AWS::StackName': {Ref: 'AWS::StackName'}
+            'AWS::Region': {Ref: 'AWS::Region'}
+            Timezone: {Ref: Timezone}
+            TileMillPassword: {Ref: TileMillPassword}
+            TileMillUsername: {Ref: TileMillUsername}
+          - |
+            #!/bin/bash -v
+            add-apt-repository -y ppa:kakrueger/openstreetmap
+            add-apt-repository -y ppa:developmentseed/mapbox
+            apt-get update
+
+            /opt/aws/bin/cfn-init -s AWS::StackName -r all_in_one --region AWS::Region
+
+            # Configure Postgres
+            cat /tmp/db_role_setup.sql | postgres psql
+            mv /tmp/postgresql.conf /etc/postgresql/9.1/main/postgresql.conf
+
+            # === Unsecuring TileMill
+            export IP=`curl http://ifconfig.me`
+            sed "s/_IP_/$IP/" /tmp/tilemill.config > /etc/tilemill/tilemill.config
+            sed "s/_IP_/$IP/" /tmp/nginx-default > /etc/nginx/sites-enabled/default
+
+            printf "TileMillUsername:$(openssl passwd -crypt 'TileMillPassword')\n" >> /etc/nginx/htpasswd
+            chown root:www-data /etc/nginx/htpasswd
+            chmod 640 /etc/nginx/htpasswd
+
+            echo "Timezone" | tee /etc/timezone
+            dpkg-reconfigure --frontend noninteractive tzdata
+
+            sysctl -w kernel.shmmax=8000000000
+            start tilemill
+            service postgresql start
+            service nginx start
+Outputs:
+  URL:
+    Description: The URL of the website
+    Value:
+      Fn::Replace:
+      - IpAddress: {'Fn::GetAtt': [all_in_one, first_private_address]}
+      - http://IpAddress/
